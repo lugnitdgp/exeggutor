@@ -5,20 +5,21 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type config struct {
-	cpu    syscall.Rlimit
-	memory syscall.Rlimit
-	aspace syscall.Rlimit
-	core   syscall.Rlimit
-	stack  syscall.Rlimit
-	fsize  syscall.Rlimit
-	nproc  syscall.Rlimit
-	clock  syscall.Rlimit
+	cpu    unix.Rlimit
+	memory unix.Rlimit
+	aspace unix.Rlimit
+	core   unix.Rlimit
+	stack  unix.Rlimit
+	fsize  unix.Rlimit
+	nproc  unix.Rlimit
 
+	clock  uint
 	minuid int32
 	maxuid int32
 }
@@ -33,15 +34,19 @@ const (
 	IE          /* IE internal error */
 )
 
+const (
+	NICE_LEVEL = 14
+)
+
 var defProfile = config{
-	syscall.Rlimit{Cur: 1, Max: 1},
-	syscall.Rlimit{Cur: 32768, Max: 32768},
-	syscall.Rlimit{Cur: 0, Max: 0},
-	syscall.Rlimit{Cur: 0, Max: 0},
-	syscall.Rlimit{Cur: 8192, Max: 8192},
-	syscall.Rlimit{Cur: 8192, Max: 8192},
-	syscall.Rlimit{Cur: 0, Max: 0},
-	syscall.Rlimit{Cur: 3, Max: 3},
+	unix.Rlimit{Cur: 1, Max: 1},
+	unix.Rlimit{Cur: 32768, Max: 32768},
+	unix.Rlimit{Cur: 0, Max: 0},
+	unix.Rlimit{Cur: 0, Max: 0},
+	unix.Rlimit{Cur: 8192, Max: 8192},
+	unix.Rlimit{Cur: 8192, Max: 8192},
+	unix.Rlimit{Cur: 0, Max: 0},
+	3,
 	5000,
 	65535,
 }
@@ -65,7 +70,7 @@ func setFlags(profile *config) {
 	nproc := flag.Uint64("nproc", uint64(defProfile.nproc.Cur), "nproc Limit")
 	fsize := flag.Uint64("fsize", uint64(defProfile.fsize.Cur), "fsize Limit")
 	stack := flag.Uint64("stack", uint64(defProfile.stack.Cur), "Stack Limit")
-	clock := flag.Uint64("clock", uint64(defProfile.clock.Cur), "Wall clock Limit in seconds")
+	clock := flag.Uint("clock", uint(defProfile.clock), "Wall clock Limit in seconds")
 	exec := flag.String("exec", "", "Command to execute")
 	fchroot := flag.String("chroot", "/tmp", "Directory to chroot")
 	ferror := flag.String("error", "/dev/null", "Print stderr to")
@@ -86,7 +91,7 @@ func setFlags(profile *config) {
 	profile.nproc.Cur, profile.nproc.Max = *nproc, *nproc
 	profile.fsize.Cur, profile.fsize.Max = *fsize, *fsize
 	profile.stack.Cur, profile.stack.Max = *stack, *stack
-	profile.clock.Cur, profile.clock.Max = *clock, *clock
+	profile.clock = *clock
 	profile.minuid = int32(*minuid)
 	profile.maxuid = int32(*maxuid)
 	chrootDir = *fchroot
@@ -102,17 +107,17 @@ func handleErr(err error) {
 	}
 }
 
-func alarm(seconds int, callback func()) (endRecSignal chan string) {
-	endRecSignal = make(chan string)
-	go func() {
-		time.AfterFunc(time.Duration(seconds)*time.Second, func() {
-			callback()
-			endRecSignal <- "time up"
-			close(endRecSignal)
-		})
-	}()
-	return
-}
+// func alarm(seconds int, callback func()) (endRecSignal chan string) {
+// 	endRecSignal = make(chan string)
+// 	go func() {
+// 		time.AfterFunc(time.Duration(seconds)*time.Second, func() {
+// 			callback()
+// 			endRecSignal <- "time up"
+// 			close(endRecSignal)
+// 		})
+// 	}()
+// 	return
+// }
 
 // func handleSignals(signal os.Signal) {
 //     switch signal {
@@ -120,6 +125,19 @@ func alarm(seconds int, callback func()) (endRecSignal chan string) {
 
 //     }
 // }
+
+func setrlimits(profile config) error {
+	var err error
+	err = unix.Setrlimit(unix.RLIMIT_CORE, &profile.core)
+	err = unix.Setrlimit(unix.RLIMIT_STACK, &profile.stack)
+	err = unix.Setrlimit(unix.RLIMIT_FSIZE, &profile.fsize)
+	err = unix.Setrlimit(unix.RLIMIT_CPU, &profile.cpu)
+	err = unix.Setrlimit(unix.RLIMIT_NPROC, &profile.nproc)
+	if profile.aspace.Max > 0 {
+		err = unix.Setrlimit(unix.RLIMIT_AS, &profile.aspace)
+	}
+	return err
+}
 
 // TODO: Change file permissions to 0640 in production
 
@@ -154,43 +172,61 @@ func main() {
 		os.Chmod(errorFile, 0644)
 	}
 
-	err = syscall.Setgid(int(profile.minuid))
+	err = unix.Setgid(int(profile.minuid))
 	handleErr(err)
 
-	err = syscall.Setuid(int(profile.minuid))
+	err = unix.Setuid(int(profile.minuid))
 	handleErr(err)
 
 	// UID 0 is administrator user in *nix OS
-	if syscall.Getuid() == 0 {
+	if unix.Getuid() == 0 {
 		fmt.Fprintf(os.Stderr, "Not changing the uid to an unpriviledged one is a BAD idea\n")
 	}
 
 	fmt.Println("start", time.Now().UnixNano())
-	pid, _, err = syscall.Syscall(syscall.SYS_FORK, 0, 0, 0)
+	pid, _, err = unix.Syscall(unix.SYS_FORK, 0, 0, 0)
 	// handleErr(err)
 	fmt.Println("forked")
 	fmt.Println(pid)
+	unix.Alarm(uint(profile.clock))
 
 	if pid == 0 {
 		// Forked/Child Process
-		for {
+		proc, err := os.FindProcess(unix.Getpid())
+		handleErr(err)
+		// Chrooting
+		if chrootDir != "/tmp" {
+			err = unix.Chdir(chrootDir)
+			if err != nil {
+				unix.Kill(unix.Getpid(), unix.SIGPIPE)
+				fmt.Fprintf(os.Stderr, "Cannot channge to chroot dir")
+			}
+			err = unix.Chroot(chrootDir)
+			if err != nil {
+				proc.Signal(unix.SIGPIPE)
+				fmt.Fprintf(os.Stderr, "Cannot channge to chroot dir")
+			}
 		}
+		// Open junk file instead of stderr
+		unix.Dup2(int(junk.Fd()), int(os.Stderr.Fd()))
+		// Set UID for the process
+		unix.Setuid(int(profile.minuid))
+		handleErr(err)
+		// Check if running as root
+		if unix.Getuid() == 0 {
+			fmt.Fprintf(os.Stderr, "Running as a root is not secure!")
+			os.Exit(1)
+		}
+		// Set Priority
+		err = unix.Setpriority(unix.PRIO_USER, int(profile.minuid), NICE_LEVEL)
+		if err != nil {
+			proc.Signal(unix.SIGPIPE)
+			fmt.Fprintf(os.Stderr, "Couldn't set priority")
+		}
+
 	} else {
 		// Parent
 		proc, err := os.FindProcess(int(pid))
-
-		alarm(int(profile.clock.Max), func() {
-			mark = RTLE
-			fmt.Println("\n", pid, "alarm")
-			if pid != 0 {
-				handleErr(err)
-				// proc.Signal(syscall.SIGALRM)
-				fmt.Println("end", time.Now().UnixNano())
-				proc.Kill()
-				fmt.Println("Killed", pid)
-			}
-		})
-
 		_, err = proc.Wait()
 		handleErr(err)
 	}
