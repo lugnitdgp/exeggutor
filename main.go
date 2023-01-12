@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,13 +15,13 @@ import (
 
 type config struct {
 	cpu    unix.Rlimit
-	memory unix.Rlimit
 	aspace unix.Rlimit
 	core   unix.Rlimit
 	stack  unix.Rlimit
 	fsize  unix.Rlimit
 	nproc  unix.Rlimit
 
+	memory uint
 	clock  uint
 	minuid int32
 	maxuid int32
@@ -38,6 +39,7 @@ const (
 
 const (
 	NICE_LEVEL = 14
+	INTERVAL   = 60
 )
 
 var defProfile = config{
@@ -62,11 +64,12 @@ var junk *os.File
 var mark int
 var pid uintptr
 var envv []string
+var pageSize int = unix.Getpagesize()
 
 func setFlags(profile *config) {
 	cpu := flag.Uint64("cpu", uint64(defProfile.cpu.Cur), "CPU Limit")
-	memory := flag.Uint64("mem", uint64(defProfile.memory.Cur), "Memory Limit")
-	aspace := flag.Uint64("space", uint64(defProfile.memory.Cur), "Space Limit")
+	memory := flag.Uint("mem", defProfile.memory, "Memory Limit")
+	aspace := flag.Uint64("space", uint64(defProfile.aspace.Cur), "Space Limit")
 	minuid := flag.Int64("minuid", int64(defProfile.minuid), "Min UID")
 	maxuid := flag.Int64("maxuid", int64(defProfile.maxuid), "Max UID")
 	core := flag.Uint64("core", uint64(defProfile.core.Cur), "Core Limit")
@@ -89,7 +92,7 @@ func setFlags(profile *config) {
 	}
 
 	profile.cpu.Cur, profile.cpu.Max = *cpu, *cpu
-	profile.memory.Cur, profile.memory.Max = *memory, *memory
+	profile.memory = *memory
 	profile.aspace.Cur, profile.aspace.Max = *aspace, *aspace
 	profile.core.Cur, profile.core.Max = *core, *core
 	profile.nproc.Cur, profile.nproc.Max = *nproc, *nproc
@@ -105,7 +108,7 @@ func setFlags(profile *config) {
 	envv = strings.Split((*envs), " ")
 }
 
-func handleErr(err error) {
+func exitOnError(err error) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s", err)
 		os.Exit(1)
@@ -130,6 +133,21 @@ func setrlimits(profile config) error {
 	return err
 }
 
+func memusage(pid int) (uint, error) {
+	p, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
+	if err != nil {
+		return 0, err
+	}
+	pStr := string(p)
+	stats := strings.Split(pStr, " ")
+	nPages, err := strconv.Atoi(stats[5])
+	if err != nil {
+		return 0, err
+	}
+	mem := uint(nPages * pageSize)
+	return mem, nil
+}
+
 // TODO: Change file permissions to 0640 in production
 
 func main() {
@@ -150,24 +168,24 @@ func main() {
 	// Opening usage and error files for o/p of this program and error o/p of user program
 	if usageFile != "/dev/null" {
 		redirect, err = os.OpenFile(usageFile, os.O_CREATE|os.O_RDWR, 0644)
-		handleErr(err)
+		exitOnError(err)
 		os.Chown(usageFile, int(profile.minuid), 0644)
 		os.Chmod(usageFile, 0644)
 		defer redirect.Close()
 	}
 
 	junk, err = os.OpenFile(errorFile, os.O_CREATE|os.O_RDWR, 0644)
-	handleErr(err)
+	exitOnError(err)
 	if errorFile != "/dev/null" {
 		os.Chown(errorFile, int(profile.minuid), 0644)
 		os.Chmod(errorFile, 0644)
 	}
 
 	err = unix.Setgid(int(profile.minuid))
-	handleErr(err)
+	exitOnError(err)
 
 	err = unix.Setuid(int(profile.minuid))
-	handleErr(err)
+	exitOnError(err)
 
 	// UID 0 is administrator user in *nix OS
 	if unix.Getuid() == 0 {
@@ -179,13 +197,16 @@ func main() {
 	// handleErr(err)
 	fmt.Println("forked")
 	fmt.Println(pid)
+	// Gets the process object and adds ptrace flag
+	proc, err := os.FindProcess(int(pid))
+	// unix.PtraceAttach(int(pid))
 
 	unix.Alarm(uint(profile.clock))
 
 	if pid == 0 {
 		// Forked/Child Process
 		proc, err := os.FindProcess(unix.Getpid())
-		handleErr(err)
+		exitOnError(err)
 		// Chrooting
 		if chrootDir != "/tmp" {
 			err = unix.Chdir(chrootDir)
@@ -201,10 +222,10 @@ func main() {
 		}
 		// Open junk file instead of stderr
 		err = unix.Dup2(int(junk.Fd()), int(os.Stderr.Fd()))
-		handleErr(err)
+		exitOnError(err)
 		// Set UID for the process
 		unix.Setuid(int(profile.minuid))
-		handleErr(err)
+		exitOnError(err)
 		// Check if running as root
 		if unix.Getuid() == 0 {
 			fmt.Fprintf(os.Stderr, "Running as a root is not secure!")
@@ -228,17 +249,39 @@ func main() {
 		}
 	} else {
 		// Parent
-		proc, err := os.FindProcess(int(pid))
-		handleErr(err)
-		_, err = proc.Wait()
-		// var status unix.WaitStatus
-		// var opts int
-		// var rusage unix.Rusage
-
-		// v, err := unix.Wait4(proc.Pid, &status, opts, &rusage)
-		// for v == 0 {
-
-		// }
+		var ws unix.WaitStatus
+		var rusage unix.Rusage
+		skips := 0
+		ticker := time.NewTicker(INTERVAL * time.Millisecond)
+		for {
+			<-ticker.C
+			wpid, err := unix.Wait4(proc.Pid, &ws, unix.WNOHANG|unix.WUNTRACED, &rusage)
+			exitOnError(err)
+			if wpid == -1 {
+				fmt.Fprintf(os.Stderr, "Process has exited cannot trace further")
+				os.Exit(1)
+			}
+			if wpid == proc.Pid && ws.Exited() {
+				ticker.Stop()
+				break
+			}
+			if !ws.Exited() {
+				// err := unix.PtraceSingleStep(wpid)
+				mem, err := memusage(proc.Pid)
+				if err != nil {
+					skips++
+				}
+				if skips > 10 {
+					mark = MLE
+					err := proc.Kill()
+					exitOnError(err)
+				} else if mem > profile.memory {
+					mark = MLE
+					err := proc.Kill()
+					exitOnError(err)
+				}
+			}
+		}
 	}
 	fmt.Println("EXITING", os.Getpid())
 }
