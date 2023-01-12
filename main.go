@@ -1,3 +1,4 @@
+// Main Process
 package main
 
 import (
@@ -5,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -59,6 +61,7 @@ var redirect *os.File
 var junk *os.File
 var mark int
 var pid uintptr
+var envv []string
 
 func setFlags(profile *config) {
 	cpu := flag.Uint64("cpu", uint64(defProfile.cpu.Cur), "CPU Limit")
@@ -72,6 +75,7 @@ func setFlags(profile *config) {
 	stack := flag.Uint64("stack", uint64(defProfile.stack.Cur), "Stack Limit")
 	clock := flag.Uint("clock", uint(defProfile.clock), "Wall clock Limit in seconds")
 	exec := flag.String("exec", "", "Command to execute")
+	envs := flag.String("env", "", "Environment variables for execution")
 	fchroot := flag.String("chroot", "/tmp", "Directory to chroot")
 	ferror := flag.String("error", "/dev/null", "Print stderr to")
 	usage := flag.String("usage", "/dev/null", "Report Statistics to")
@@ -98,6 +102,7 @@ func setFlags(profile *config) {
 	errorFile = *ferror
 	usageFile = *usage
 	cmd = *exec
+	envv = strings.Split((*envs), " ")
 }
 
 func handleErr(err error) {
@@ -107,32 +112,18 @@ func handleErr(err error) {
 	}
 }
 
-// func alarm(seconds int, callback func()) (endRecSignal chan string) {
-// 	endRecSignal = make(chan string)
-// 	go func() {
-// 		time.AfterFunc(time.Duration(seconds)*time.Second, func() {
-// 			callback()
-// 			endRecSignal <- "time up"
-// 			close(endRecSignal)
-// 		})
-// 	}()
-// 	return
-// }
-
-// func handleSignals(signal os.Signal) {
-//     switch signal {
-//     case syscall.SIGALRM:
-
-//     }
-// }
+func signalHandler() error {
+	return nil
+}
 
 func setrlimits(profile config) error {
 	var err error
 	err = unix.Setrlimit(unix.RLIMIT_CORE, &profile.core)
 	err = unix.Setrlimit(unix.RLIMIT_STACK, &profile.stack)
 	err = unix.Setrlimit(unix.RLIMIT_FSIZE, &profile.fsize)
-	err = unix.Setrlimit(unix.RLIMIT_CPU, &profile.cpu)
 	err = unix.Setrlimit(unix.RLIMIT_NPROC, &profile.nproc)
+	err = unix.Setrlimit(unix.RLIMIT_CPU, &profile.cpu)
+	// Address space(including libraries) limit
 	if profile.aspace.Max > 0 {
 		err = unix.Setrlimit(unix.RLIMIT_AS, &profile.aspace)
 	}
@@ -188,6 +179,7 @@ func main() {
 	// handleErr(err)
 	fmt.Println("forked")
 	fmt.Println(pid)
+
 	unix.Alarm(uint(profile.clock))
 
 	if pid == 0 {
@@ -198,17 +190,18 @@ func main() {
 		if chrootDir != "/tmp" {
 			err = unix.Chdir(chrootDir)
 			if err != nil {
-				unix.Kill(unix.Getpid(), unix.SIGPIPE)
 				fmt.Fprintf(os.Stderr, "Cannot channge to chroot dir")
+				proc.Signal(unix.SIGPIPE)
 			}
 			err = unix.Chroot(chrootDir)
 			if err != nil {
-				proc.Signal(unix.SIGPIPE)
 				fmt.Fprintf(os.Stderr, "Cannot channge to chroot dir")
+				proc.Signal(unix.SIGPIPE)
 			}
 		}
 		// Open junk file instead of stderr
-		unix.Dup2(int(junk.Fd()), int(os.Stderr.Fd()))
+		err = unix.Dup2(int(junk.Fd()), int(os.Stderr.Fd()))
+		handleErr(err)
 		// Set UID for the process
 		unix.Setuid(int(profile.minuid))
 		handleErr(err)
@@ -220,15 +213,32 @@ func main() {
 		// Set Priority
 		err = unix.Setpriority(unix.PRIO_USER, int(profile.minuid), NICE_LEVEL)
 		if err != nil {
-			proc.Signal(unix.SIGPIPE)
 			fmt.Fprintf(os.Stderr, "Couldn't set priority")
+			proc.Signal(unix.SIGPIPE)
 		}
+		// Setrlimit syscalls
+		err = setrlimits(profile)
 
+		cmdArr := strings.Split(cmd, " ")
+		// Start execution of user program
+		err = unix.Exec(cmdArr[0], cmdArr, envv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Couldn't run the program")
+			proc.Signal(unix.SIGPIPE)
+		}
 	} else {
 		// Parent
 		proc, err := os.FindProcess(int(pid))
-		_, err = proc.Wait()
 		handleErr(err)
+		_, err = proc.Wait()
+		// var status unix.WaitStatus
+		// var opts int
+		// var rusage unix.Rusage
+
+		// v, err := unix.Wait4(proc.Pid, &status, opts, &rusage)
+		// for v == 0 {
+
+		// }
 	}
 	fmt.Println("EXITING", os.Getpid())
 }
