@@ -28,28 +28,29 @@ type config struct {
 }
 
 const (
-	OK   = iota /* OK process finished normally */
-	OLE         /* OLE output limit exceeded */
-	MLE         /* MLE memory limit exceeded */
-	TLE         /* TLE time limit exceeded */
-	RTLE        /* RTLE time limit exceeded(wall clock) */
-	RF          /* RF invalid function */
-	IE          /* IE internal error */
+	OK   = "OK\n"   /* OK : process finished normally */
+	OLE  = "OLE\n"  /* OLE : output limit exceeded */
+	MLE  = "MLE\n"  /* MLE : memory limit exceeded */
+	TLE  = "TLE\n"  /* TLE : time limit exceeded */
+	RTLE = "RTLE\n" /* RTLE : time limit exceeded(wall clock) */
+	RF   = "RF\n"   /* RF : invalid function */
+	IE   = "IE\n"   /* IE : internal error */
+	NZEC = "NZEC\n" /* NZEC : Non-Zero Error Code */
 )
 
 const (
 	NICE_LEVEL = 14
-	INTERVAL   = 60
+	INTERVAL   = 1
 )
 
 var defProfile = config{
 	unix.Rlimit{Cur: 1, Max: 1},
-	unix.Rlimit{Cur: 32768, Max: 32768},
 	unix.Rlimit{Cur: 0, Max: 0},
 	unix.Rlimit{Cur: 0, Max: 0},
 	unix.Rlimit{Cur: 8192, Max: 8192},
 	unix.Rlimit{Cur: 8192, Max: 8192},
 	unix.Rlimit{Cur: 0, Max: 0},
+	32768,
 	3,
 	5000,
 	65535,
@@ -58,13 +59,16 @@ var defProfile = config{
 var chrootDir = "/tmp"
 var errorFile = "/dev/null"
 var usageFile = "/dev/null"
+var outFile = "./out.txt"
 var cmd = ""
-var redirect *os.File
-var junk *os.File
-var mark int
+var usageFp *os.File
+var junkFp *os.File
+var outFp *os.File
+var mark string
 var pid uintptr
 var envv []string
 var pageSize int = unix.Getpagesize()
+var mem uint
 
 func setFlags(profile *config) {
 	cpu := flag.Uint64("cpu", uint64(defProfile.cpu.Cur), "CPU Limit")
@@ -82,6 +86,7 @@ func setFlags(profile *config) {
 	fchroot := flag.String("chroot", "/tmp", "Directory to chroot")
 	ferror := flag.String("error", "/dev/null", "Print stderr to")
 	usage := flag.String("usage", "/dev/null", "Report Statistics to")
+	outfile := flag.String("outfile", "./out.txt", "Print output to file")
 
 	flag.Parse()
 
@@ -104,6 +109,7 @@ func setFlags(profile *config) {
 	chrootDir = *fchroot
 	errorFile = *ferror
 	usageFile = *usage
+	outFile = *outfile
 	cmd = *exec
 	envv = strings.Split((*envs), " ")
 }
@@ -115,9 +121,9 @@ func exitOnError(err error) {
 	}
 }
 
-func signalHandler() error {
-	return nil
-}
+// func signalHandler() error {
+// 	return nil
+// }
 
 func setrlimits(profile config) error {
 	var err error
@@ -132,6 +138,11 @@ func setrlimits(profile config) error {
 	}
 	return err
 }
+
+// func printstats(byts string) {
+// 	redirect.Seek(0, 2)
+// 	redirect.WriteString(byts)
+// }
 
 func memusage(pid int) (uint, error) {
 	p, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
@@ -148,14 +159,19 @@ func memusage(pid int) (uint, error) {
 	return mem, nil
 }
 
+func printstats(byts string) {
+	usageFp.Seek(0, 2)
+	usageFp.WriteString(byts)
+}
+
 // TODO: Change file permissions to 0640 in production
 
 func main() {
 	profile := defProfile
 	setFlags(&profile)
 
-	// var tstart, tfinish time.Time
-	redirect = os.Stderr
+	var tstart, tfinish int64
+	usageFp = os.Stderr
 	var err error
 
 	// Get an unused UID
@@ -167,19 +183,29 @@ func main() {
 
 	// Opening usage and error files for o/p of this program and error o/p of user program
 	if usageFile != "/dev/null" {
-		redirect, err = os.OpenFile(usageFile, os.O_CREATE|os.O_RDWR, 0644)
+		usageFp, err = os.OpenFile(usageFile, os.O_CREATE|os.O_RDWR, 0644)
 		exitOnError(err)
+		os.Truncate(usageFile, 0)
 		os.Chown(usageFile, int(profile.minuid), 0644)
 		os.Chmod(usageFile, 0644)
-		defer redirect.Close()
+		defer usageFp.Close()
 	}
 
-	junk, err = os.OpenFile(errorFile, os.O_CREATE|os.O_RDWR, 0644)
+	junkFp, err = os.OpenFile(errorFile, os.O_CREATE|os.O_RDWR, 0644)
 	exitOnError(err)
+	junkFp.Truncate(0)
 	if errorFile != "/dev/null" {
 		os.Chown(errorFile, int(profile.minuid), 0644)
 		os.Chmod(errorFile, 0644)
 	}
+	defer junkFp.Close()
+
+	outp, err := os.OpenFile(outFile, os.O_CREATE|os.O_RDWR, 0644)
+	exitOnError(err)
+	outp.Truncate(0)
+	os.Chown(outFile, int(profile.minuid), 0644)
+	os.Chmod(outFile, 0644)
+	defer outp.Close()
 
 	err = unix.Setgid(int(profile.minuid))
 	exitOnError(err)
@@ -192,21 +218,21 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Not changing the uid to an unpriviledged one is a BAD idea\n")
 	}
 
+	unix.Alarm(uint(profile.clock))
+
 	fmt.Println("start", time.Now().UnixNano())
+	tstart = time.Now().UnixNano()
+
 	pid, _, err = unix.Syscall(unix.SYS_FORK, 0, 0, 0)
 	// handleErr(err)
 	fmt.Println("forked")
-	fmt.Println(pid)
 	// Gets the process object and adds ptrace flag
 	proc, err := os.FindProcess(int(pid))
 	// unix.PtraceAttach(int(pid))
 
-	unix.Alarm(uint(profile.clock))
-
 	if pid == 0 {
 		// Forked/Child Process
-		proc, err := os.FindProcess(unix.Getpid())
-		exitOnError(err)
+		fmt.Println("IN CHILD PROCESS")
 		// Chrooting
 		if chrootDir != "/tmp" {
 			err = unix.Chdir(chrootDir)
@@ -220,68 +246,73 @@ func main() {
 				proc.Signal(unix.SIGPIPE)
 			}
 		}
-		// Open junk file instead of stderr
-		err = unix.Dup2(int(junk.Fd()), int(os.Stderr.Fd()))
-		exitOnError(err)
-		// Set UID for the process
-		unix.Setuid(int(profile.minuid))
-		exitOnError(err)
+
+		// fmt.Println("UIDs: ", profile.minuid, "  ", unix.Getuid())
+
 		// Check if running as root
 		if unix.Getuid() == 0 {
 			fmt.Fprintf(os.Stderr, "Running as a root is not secure!")
 			os.Exit(1)
 		}
+
 		// Set Priority
 		err = unix.Setpriority(unix.PRIO_USER, int(profile.minuid), NICE_LEVEL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Couldn't set priority")
 			proc.Signal(unix.SIGPIPE)
 		}
-		// Setrlimit syscalls
-		err = setrlimits(profile)
 
-		cmdArr := strings.Split(cmd, " ")
+		// Setrlimit syscalls
+		// err = setrlimits(profile)
+		// fmt.Println(err)
+
+		// TODO: Keep 267,8 commented in dev
+		// // Open junk file instead of stderr
+		// err = unix.Dup2(int(junk.Fd()), int(os.Stderr.Fd()))
+		// exitOnError(err)
+
+		// Use out file instead of stdout
+		err = unix.Dup2(int(outp.Fd()), int(os.Stdout.Fd()))
+		exitOnError(err)
+
+		cmdArr := []string{"/bin/bash", "-c", cmd}
 		// Start execution of user program
-		err = unix.Exec(cmdArr[0], cmdArr, envv)
+		err = unix.Exec("/bin/bash", cmdArr, envv)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Couldn't run the program")
 			proc.Signal(unix.SIGPIPE)
 		}
 	} else {
-		// Parent
-		var ws unix.WaitStatus
-		var rusage unix.Rusage
-		skips := 0
-		ticker := time.NewTicker(INTERVAL * time.Millisecond)
-		for {
-			<-ticker.C
-			wpid, err := unix.Wait4(proc.Pid, &ws, unix.WNOHANG|unix.WUNTRACED, &rusage)
-			exitOnError(err)
-			if wpid == -1 {
-				fmt.Fprintf(os.Stderr, "Process has exited cannot trace further")
-				os.Exit(1)
-			}
-			if wpid == proc.Pid && ws.Exited() {
-				ticker.Stop()
-				break
-			}
-			if !ws.Exited() {
-				// err := unix.PtraceSingleStep(wpid)
-				mem, err := memusage(proc.Pid)
-				if err != nil {
-					skips++
-				}
-				if skips > 10 {
-					mark = MLE
-					err := proc.Kill()
-					exitOnError(err)
-				} else if mem > profile.memory {
-					mark = MLE
-					err := proc.Kill()
-					exitOnError(err)
-				}
-			}
-		}
+		fmt.Println("IN PARENT PROCESS")
+		state, err := proc.Wait()
+		exitOnError(err)
+		fmt.Println(state.Exited())
+		// ticker := time.NewTicker(INTERVAL * time.Millisecond)
+		// var ws unix.WaitStatus
+		// var rusage unix.Rusage
+		// for {
+		// 	<-ticker.C
+		// 	fmt.Println("Polling process activity")
+		// 	fmt.Println(time.Now().UnixNano())
+		// 	_, err := unix.Wait4(proc.Pid, &ws, unix.WNOHANG|unix.WUNTRACED|unix.WCONTINUED, &rusage)
+		// 	if err != nil {
+		// 		panic(err)
+		// 	}
+		// 	fmt.Println(time.Now().UnixNano())
+		// 	if ws.Exited() {
+		// 		fmt.Printf("PID: %d\nEXIT_CODE: %d\n", proc.Pid, ws.ExitStatus())
+		// 		ticker.Stop()
+		// 		break
+		// 	}
+		// 	if !ws.Exited() {
+		// 		// fmt.Println("SYS_USAGE:", (state.SysUsage()))
+		// 		mem, _ := memusage(proc.Pid)
+		// 		fmt.Printf("MEM_USAGE: %d\n", mem)
+		// 	}
+		// }
+
 	}
+	tfinish = time.Now().UnixNano()
+	fmt.Printf("TIME: %.03f s\n", float64((tfinish-tstart)/1000000000))
 	fmt.Println("EXITING", os.Getpid())
 }
