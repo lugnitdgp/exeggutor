@@ -70,6 +70,7 @@ var pid uintptr
 var envv []string
 var pageSize int = unix.Getpagesize()
 var mem uint
+var ns2s = 1000000000.000
 
 func setFlags(profile *config) {
 	cpu := flag.Uint64("cpu", uint64(defProfile.cpu.Cur), "CPU Limit")
@@ -227,28 +228,26 @@ func main() {
 		<-c
 		fmt.Println("Received SIGALRM")
 		mark = TLE
-		fmt.Println(mark)
+		fmt.Print(mark)
 		proc, err := os.FindProcess((int(pid)))
 		if err == nil {
 			proc.Kill()
 		} else {
 			fmt.Println("TLE but cannot kill child process")
 		}
+		tfinish = time.Now().UnixNano()
 	}()
 
 	fmt.Println("start", time.Now().UnixNano())
 	tstart = time.Now().UnixNano()
 
 	pid, _, err = unix.Syscall(unix.SYS_FORK, 0, 0, 0)
-	// handleErr(err)
-	fmt.Println("forked")
 	// Gets the process object (and adds ptrace flag)
 	proc, err := os.FindProcess(int(pid))
 	// unix.PtraceAttach(int(pid))
 
 	if pid == 0 {
 		// Forked/Child Process
-		fmt.Println("IN CHILD PROCESS")
 		// Chrooting
 		if chrootDir != "/tmp" {
 			err = unix.Chdir(chrootDir)
@@ -299,10 +298,10 @@ func main() {
 			proc.Signal(unix.SIGPIPE)
 		}
 	} else {
-		fmt.Println("IN PARENT PROCESS")
 		state, err := proc.Wait()
 		exitOnError(err)
 		fmt.Println(state.Exited())
+
 		// ticker := time.NewTicker(INTERVAL * time.Millisecond)
 		// var ws unix.WaitStatus
 		// var rusage unix.Rusage
@@ -329,6 +328,6 @@ func main() {
 
 	}
 	tfinish = time.Now().UnixNano()
-	fmt.Printf("TIME: %.03f s\n", float64((tfinish-tstart)/1000000000))
+	fmt.Printf("TIME: %.03f s\n", float64(tfinish-tstart)/ns2s)
 	fmt.Println("EXITING", os.Getpid())
 }
