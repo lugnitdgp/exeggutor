@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"time"
@@ -39,8 +40,8 @@ const (
 )
 
 const (
-	NICE_LEVEL = 14
-	INTERVAL   = 1
+	niceLvl  = 14
+	interval = 1
 )
 
 var defProfile = config{
@@ -122,6 +123,7 @@ func exitOnError(err error) {
 }
 
 // func signalHandler() error {
+
 // 	return nil
 // }
 
@@ -219,6 +221,20 @@ func main() {
 	}
 
 	unix.Alarm(uint(profile.clock))
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, unix.SIGALRM)
+	go func() {
+		<-c
+		fmt.Println("Received SIGALRM")
+		mark = TLE
+		fmt.Println(mark)
+		proc, err := os.FindProcess((int(pid)))
+		if err == nil {
+			proc.Kill()
+		} else {
+			fmt.Println("TLE but cannot kill child process")
+		}
+	}()
 
 	fmt.Println("start", time.Now().UnixNano())
 	tstart = time.Now().UnixNano()
@@ -226,7 +242,7 @@ func main() {
 	pid, _, err = unix.Syscall(unix.SYS_FORK, 0, 0, 0)
 	// handleErr(err)
 	fmt.Println("forked")
-	// Gets the process object and adds ptrace flag
+	// Gets the process object (and adds ptrace flag)
 	proc, err := os.FindProcess(int(pid))
 	// unix.PtraceAttach(int(pid))
 
@@ -256,7 +272,7 @@ func main() {
 		}
 
 		// Set Priority
-		err = unix.Setpriority(unix.PRIO_USER, int(profile.minuid), NICE_LEVEL)
+		err = unix.Setpriority(unix.PRIO_USER, int(profile.minuid), niceLvl)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Couldn't set priority")
 			proc.Signal(unix.SIGPIPE)
