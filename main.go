@@ -67,7 +67,7 @@ var outFp *os.File
 var mark string
 var pid uintptr
 var envv []string
-var pageSize int = unix.Getpagesize()
+var pageSize int = unix.Getpagesize() / 1024
 var mem uint
 var ns2s = 1000000000.000
 
@@ -159,24 +159,31 @@ func setrlimits(profile config) error {
 	return err
 }
 
-// func printstats(byts string) {
-// 	redirect.Seek(0, 2)
-// 	redirect.WriteString(byts)
-// }
-
 func memusage(pid int) (uint, error) {
-	p, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
+	statm, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
 	if err != nil {
 		return 0, err
 	}
-	pStr := string(p)
-	stats := strings.Split(pStr, " ")
-	nPages, err := strconv.Atoi(stats[5])
+	statmStr := string(statm)
+	statmArr := strings.Split(statmStr, " ")
+	nPages, err := strconv.Atoi(statmArr[5])
 	if err != nil {
 		return 0, err
 	}
 	mem := uint(nPages * pageSize)
 	return mem, nil
+}
+
+func timeusage(pid int) (int, int, error) {
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, 0, err
+	}
+	statStr := string(stat)
+	statArr := strings.Split(statStr, " ")
+	utime, err := strconv.Atoi(statArr[13])
+	stime, err := strconv.Atoi(statArr[14])
+	return utime, stime, err
 }
 
 func printstats(byts string) {
@@ -240,7 +247,7 @@ func main() {
 	}
 
 	/*	Sets Wall Clock timer for parent process
-		parent intercepts the signal and kills the child and sets TLE */
+		parent intercepts the signal and kills the child and sets RTLE */
 	unix.Alarm(uint(profile.clock))
 
 	// Signal Handler for SIGALRM
@@ -249,7 +256,7 @@ func main() {
 	go func() {
 		<-c
 		fmt.Println("Received SIGALRM")
-		mark = TLE
+		mark = RTLE
 		fmt.Print(mark)
 		proc, err := os.FindProcess((int(pid)))
 		if err == nil {
@@ -321,34 +328,43 @@ func main() {
 			proc.Signal(unix.SIGPIPE)
 		}
 	} else {
-		state, err := proc.Wait()
-		exitOnError(err)
-		fmt.Printf("EXITED: %s\tEXIT CODE: %d\n", boolSolver(state.Exited()), state.ExitCode())
+		var ws unix.WaitStatus
+		var rusage unix.Rusage
+		ticker := time.NewTicker(interval * time.Millisecond)
 
-		// ticker := time.NewTicker(INTERVAL * time.Millisecond)
-		// var ws unix.WaitStatus
-		// var rusage unix.Rusage
-		// for {
-		// 	<-ticker.C
-		// 	fmt.Println("Polling process activity")
-		// 	fmt.Println(time.Now().UnixNano())
-		// 	_, err := unix.Wait4(proc.Pid, &ws, unix.WNOHANG|unix.WUNTRACED|unix.WCONTINUED, &rusage)
-		// 	if err != nil {
-		// 		panic(err)
-		// 	}
-		// 	fmt.Println(time.Now().UnixNano())
-		// 	if ws.Exited() {
-		// 		fmt.Printf("PID: %d\nEXIT_CODE: %d\n", proc.Pid, ws.ExitStatus())
-		// 		ticker.Stop()
-		// 		break
-		// 	}
-		// 	if !ws.Exited() {
-		// 		// fmt.Println("SYS_USAGE:", (state.SysUsage()))
-		// 		mem, _ := memusage(proc.Pid)
-		// 		fmt.Printf("MEM_USAGE: %d\n", mem)
-		// 	}
-		// }
+		for {
+			<-ticker.C
+			fmt.Println("\nPolling process activity")
+			wpid, err := unix.Wait4(proc.Pid, &ws, unix.WNOHANG|unix.WUNTRACED, &rusage)
+			ws = *new(unix.WaitStatus)
+			rusage = *new(unix.Rusage)
+			if err != nil {
+				fmt.Println(err)
+			}
+			if wpid == 0 {
+				// Child Process hasn't died and we can check its resource utilization
+				utime, stime, err := timeusage(proc.Pid)
+				fmt.Printf("STIME: %d\tUTIME: %d\n", stime, utime)
+				mem, err := memusage(proc.Pid)
+				if err != nil {
+					exitOnError(err)
+				}
+				fmt.Printf("MEMORY USAGE: %d kB\n", mem)
 
+				fmt.Printf("EXITED: %s\tEXIT CODE: %d\n", boolSolver(ws.Exited()), ws.ExitStatus())
+				fmt.Printf("SIGNALLED: %s\tSIGNAL: %d\n", boolSolver(ws.Signaled()), ws.Signal())
+				fmt.Printf("STOPPED: %s\tSTOP SIGNAL: %d\n", boolSolver(ws.Stopped()), ws.StopSignal())
+			} else {
+				// Child Process has died
+				fmt.Printf("EXITED: %s\tEXIT CODE: %d\n", boolSolver(ws.Exited()), ws.ExitStatus())
+				fmt.Printf("SIGNALLED: %s\tSIGNAL: %d\n", boolSolver(ws.Signaled()), ws.Signal())
+				fmt.Printf("STOPPED: %s\tSTOP SIGNAL: %d\n", boolSolver(ws.Stopped()), ws.StopSignal())
+				ticker.Stop()
+				fmt.Println()
+				break
+			}
+			fmt.Println()
+		}
 	}
 	tfinish = time.Now().UnixNano()
 	fmt.Printf("TIME: %.03f s\n", float64(tfinish-tstart)/ns2s)
