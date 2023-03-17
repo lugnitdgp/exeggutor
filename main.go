@@ -21,11 +21,23 @@ type config struct {
 	stack  unix.Rlimit
 	fsize  unix.Rlimit
 	nproc  unix.Rlimit
-
 	memory uint
 	clock  uint
 	minuid int32
 	maxuid int32
+}
+
+var defProfile = config{
+	unix.Rlimit{Cur: 1024, Max: 1},
+	unix.Rlimit{Cur: 1024, Max: 0},
+	unix.Rlimit{Cur: 1024, Max: 0},
+	unix.Rlimit{Cur: 8192, Max: 8192},
+	unix.Rlimit{Cur: 8192, Max: 8192},
+	unix.Rlimit{Cur: 1, Max: 0},
+	32768,
+	1,
+	5000,
+	65535,
 }
 
 const (
@@ -44,19 +56,6 @@ const (
 	interval = 1
 )
 
-var defProfile = config{
-	unix.Rlimit{Cur: 1, Max: 1},
-	unix.Rlimit{Cur: 0, Max: 0},
-	unix.Rlimit{Cur: 0, Max: 0},
-	unix.Rlimit{Cur: 8192, Max: 8192},
-	unix.Rlimit{Cur: 8192, Max: 8192},
-	unix.Rlimit{Cur: 0, Max: 0},
-	32768,
-	3,
-	5000,
-	65535,
-}
-
 var chrootDir = "/tmp"
 var errorFile = "/dev/null"
 var usageFile = "/dev/null"
@@ -71,6 +70,13 @@ var envv []string
 var pageSize int = unix.Getpagesize()
 var mem uint
 var ns2s = 1000000000.000
+
+func boolSolver(b bool) string {
+	if b == true {
+		return "true"
+	}
+	return "false"
+}
 
 func setFlags(profile *config) {
 	cpu := flag.Uint64("cpu", uint64(defProfile.cpu.Cur), "CPU Limit")
@@ -123,18 +129,29 @@ func exitOnError(err error) {
 	}
 }
 
-// func signalHandler() error {
-
-// 	return nil
-// }
-
+// * Error in test case: stack size, fsize, nproc
 func setrlimits(profile config) error {
 	var err error
 	err = unix.Setrlimit(unix.RLIMIT_CORE, &profile.core)
+	if err != nil {
+		return err
+	}
 	err = unix.Setrlimit(unix.RLIMIT_STACK, &profile.stack)
+	if err != nil {
+		return err
+	}
 	err = unix.Setrlimit(unix.RLIMIT_FSIZE, &profile.fsize)
+	if err != nil {
+		return err
+	}
 	err = unix.Setrlimit(unix.RLIMIT_NPROC, &profile.nproc)
+	if err != nil {
+		return err
+	}
 	err = unix.Setrlimit(unix.RLIMIT_CPU, &profile.cpu)
+	if err != nil {
+		return err
+	}
 	// Address space(including libraries) limit
 	if profile.aspace.Max > 0 {
 		err = unix.Setrlimit(unix.RLIMIT_AS, &profile.aspace)
@@ -184,7 +201,8 @@ func main() {
 		profile.minuid += rand1.Int31n(profile.maxuid - profile.minuid)
 	}
 
-	// Opening usage and error files for o/p of this program and error o/p of user program
+	/*	Opening usage and error files for
+		o/p of this program and error o/p of user program */
 	if usageFile != "/dev/null" {
 		usageFp, err = os.OpenFile(usageFile, os.O_CREATE|os.O_RDWR, 0644)
 		exitOnError(err)
@@ -221,7 +239,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Not changing the uid to an unpriviledged one is a BAD idea\n")
 	}
 
+	/*	Sets Wall Clock timer for parent process
+		parent intercepts the signal and kills the child and sets TLE */
 	unix.Alarm(uint(profile.clock))
+
+	// Signal Handler for SIGALRM
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, unix.SIGALRM)
 	go func() {
@@ -278,8 +300,8 @@ func main() {
 		}
 
 		// Setrlimit syscalls
-		// err = setrlimits(profile)
-		// fmt.Println(err)
+		setrlimits(profile)
+		fmt.Println("SETRLIMITS ERROR:", err)
 
 		// TODO: Keep 267,8 commented in dev
 		// // Open junk file instead of stderr
@@ -291,16 +313,17 @@ func main() {
 		exitOnError(err)
 
 		cmdArr := []string{"/bin/bash", "-c", cmd}
+		// fmt.Println(cmdArr)
 		// Start execution of user program
 		err = unix.Exec("/bin/bash", cmdArr, envv)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Couldn't run the program")
+			fmt.Printf("Couldn't run the program")
 			proc.Signal(unix.SIGPIPE)
 		}
 	} else {
 		state, err := proc.Wait()
 		exitOnError(err)
-		fmt.Println(state.Exited())
+		fmt.Printf("EXITED: %s\tEXIT CODE: %d\n", boolSolver(state.Exited()), state.ExitCode())
 
 		// ticker := time.NewTicker(INTERVAL * time.Millisecond)
 		// var ws unix.WaitStatus
