@@ -53,7 +53,7 @@ const (
 
 const (
 	niceLvl  = 14
-	interval = 1
+	interval = 15
 )
 
 var chrootDir = "/tmp"
@@ -153,7 +153,7 @@ func setrlimits(profile config) error {
 		return err
 	}
 	// Address space(including libraries) limit
-	if profile.aspace.Max > 0 {
+	if profile.aspace.Cur > 0 {
 		err = unix.Setrlimit(unix.RLIMIT_AS, &profile.aspace)
 	}
 	return err
@@ -335,9 +335,9 @@ func main() {
 		for {
 			<-ticker.C
 			fmt.Println("\nPolling process activity")
-			wpid, err := unix.Wait4(proc.Pid, &ws, unix.WNOHANG|unix.WUNTRACED, &rusage)
 			ws = *new(unix.WaitStatus)
 			rusage = *new(unix.Rusage)
+			wpid, err := unix.Wait4(proc.Pid, &ws, unix.WNOHANG|unix.WUNTRACED, &rusage)
 			if err != nil {
 				fmt.Println(err)
 			}
