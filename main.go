@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -21,7 +22,7 @@ type config struct {
 	stack  unix.Rlimit
 	fsize  unix.Rlimit
 	nproc  unix.Rlimit
-	memory uint
+	memory unix.Rlimit
 	clock  uint
 	minuid int32
 	maxuid int32
@@ -34,21 +35,56 @@ var defProfile = config{
 	unix.Rlimit{Cur: 8192, Max: 8192},
 	unix.Rlimit{Cur: 8192, Max: 8192},
 	unix.Rlimit{Cur: 1, Max: 0},
-	32768,
+	unix.Rlimit{Cur: 32768, Max: 32768},
 	1,
 	5000,
 	65535,
 }
 
+var signalNames = []string{
+	"UNKONWN",   /*  0 */
+	"SIGHUP",    /*  1 */
+	"SIGINT",    /*  2 */
+	"SIGQUIT",   /*  3 */
+	"SIGILL",    /*  4 */
+	"SIGTRAP",   /*  5 */
+	"SIGABRT",   /*  6 */
+	"SIGBUS",    /*  7 */
+	"SIGFPE",    /*  8 */
+	"SIGKILL",   /*  9 */
+	"SIGUSR1",   /* 10 */
+	"SIGSEGV",   /* 11 */
+	"SIGUSR2",   /* 12 */
+	"SIGPIPE",   /* 13 */
+	"SIGALRM",   /* 14 */
+	"SIGTERM",   /* 15 */
+	"SIGSTKFLT", /* 16 */
+	"SIGCHLD",   /* 17 */
+	"SIGCONT",   /* 18 */
+	"SIGSTOP",   /* 19 */
+	"SIGTSTP",   /* 20 */
+	"SIGTTIN",   /* 21 */
+	"SIGTTOU",   /* 22 */
+	"SIGURG",    /* 23 */
+	"SIGXCPU",   /* 24 */
+	"SIGXFSZ",   /* 25 */
+	"SIGVTALRM", /* 26 */
+	"SIGPROF",   /* 27 */
+	"SIGWINCH",  /* 28 */
+	"SIGIO",     /* 29 */
+	"SIGPWR",    /* 30 */
+	"SIGSYS",    /* 31 */
+}
+
 const (
-	OK   = "OK\n"   /* OK : process finished normally */
-	OLE  = "OLE\n"  /* OLE : output limit exceeded */
-	MLE  = "MLE\n"  /* MLE : memory limit exceeded */
-	TLE  = "TLE\n"  /* TLE : time limit exceeded */
-	RTLE = "RTLE\n" /* RTLE : time limit exceeded(wall clock) */
-	RF   = "RF\n"   /* RF : invalid function */
-	IE   = "IE\n"   /* IE : internal error */
-	NZEC = "NZEC\n" /* NZEC : Non-Zero Error Code */
+	OK   = "OK\n"      /* OK : process finished normally */
+	OLE  = "OLE\n"     /* OLE : output limit exceeded */
+	MLE  = "MLE\n"     /* MLE : memory limit exceeded */
+	TLE  = "TLE\n"     /* TLE : time limit exceeded */
+	RTLE = "RTLE\n"    /* RTLE : time limit exceeded(wall clock) */
+	RF   = "RF\n"      /* RF : invalid function */
+	IE   = "IE\n"      /* IE : internal error */
+	NZEC = "NZEC %d\n" /* NZEC : Non-Zero Error Code */
 )
 
 const (
@@ -80,7 +116,7 @@ func boolSolver(b bool) string {
 
 func setFlags(profile *config) {
 	cpu := flag.Uint64("cpu", uint64(defProfile.cpu.Cur), "CPU Limit")
-	memory := flag.Uint("mem", defProfile.memory, "Memory Limit")
+	memory := flag.Uint64("mem", uint64(defProfile.memory.Cur), "Memory Limit")
 	aspace := flag.Uint64("space", uint64(defProfile.aspace.Cur), "Space Limit")
 	minuid := flag.Int64("minuid", int64(defProfile.minuid), "Min UID")
 	maxuid := flag.Int64("maxuid", int64(defProfile.maxuid), "Max UID")
@@ -105,7 +141,7 @@ func setFlags(profile *config) {
 	}
 
 	profile.cpu.Cur, profile.cpu.Max = *cpu, *cpu
-	profile.memory = *memory
+	profile.memory.Cur, profile.memory.Max = *memory, *memory
 	profile.aspace.Cur, profile.aspace.Max = *aspace, *aspace
 	profile.core.Cur, profile.core.Max = *core, *core
 	profile.nproc.Cur, profile.nproc.Max = *nproc, *nproc
@@ -152,6 +188,10 @@ func setrlimits(profile config) error {
 	if err != nil {
 		return err
 	}
+	err = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &profile.memory)
+	if err != nil {
+		return err
+	}
 	// Address space(including libraries) limit
 	if profile.aspace.Cur > 0 {
 		err = unix.Setrlimit(unix.RLIMIT_AS, &profile.aspace)
@@ -159,7 +199,7 @@ func setrlimits(profile config) error {
 	return err
 }
 
-func memusage(pid int) (uint, error) {
+func memusage(pid int) (int, error) {
 	statm, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
 	if err != nil {
 		return 0, err
@@ -170,7 +210,7 @@ func memusage(pid int) (uint, error) {
 	if err != nil {
 		return 0, err
 	}
-	mem := uint(nPages * pageSize)
+	mem := nPages * pageSize
 	return mem, nil
 }
 
@@ -198,6 +238,8 @@ func main() {
 	setFlags(&profile)
 
 	var tstart, tfinish int64
+	var mem, skips int
+	var utime int64
 	usageFp = os.Stderr
 	var err error
 
@@ -308,7 +350,7 @@ func main() {
 
 		// Setrlimit syscalls
 		setrlimits(profile)
-		fmt.Println("SETRLIMITS ERROR:", err)
+		// fmt.Println("SETRLIMITS ERROR:", err)
 
 		// TODO: Keep 267,8 commented in dev
 		// // Open junk file instead of stderr
@@ -334,7 +376,7 @@ func main() {
 
 		for {
 			<-ticker.C
-			fmt.Println("\nPolling process activity")
+			// fmt.Println("\nPolling process activity")
 			ws = *new(unix.WaitStatus)
 			rusage = *new(unix.Rusage)
 			wpid, err := unix.Wait4(proc.Pid, &ws, unix.WNOHANG|unix.WUNTRACED, &rusage)
@@ -343,30 +385,53 @@ func main() {
 			}
 			if wpid == 0 {
 				// Child Process hasn't died and we can check its resource utilization
-				utime, stime, err := timeusage(proc.Pid)
-				fmt.Printf("STIME: %d\tUTIME: %d\n", stime, utime)
-				mem, err := memusage(proc.Pid)
+				mem, err = memusage(proc.Pid)
+				utime = rusage.Utime.Sec
+				// fmt.Printf("UTIME: %d %d\n", rusage.Utime.Sec, rusage.Utime.Usec)
+				// fmt.Printf("STIME: %d %d\n", rusage.Stime.Sec, rusage.Stime.Usec)
 				if err != nil {
-					exitOnError(err)
+					skips++
 				}
-				fmt.Printf("MEMORY USAGE: %d kB\n", mem)
-
-				fmt.Printf("EXITED: %s\tEXIT CODE: %d\n", boolSolver(ws.Exited()), ws.ExitStatus())
-				fmt.Printf("SIGNALLED: %s\tSIGNAL: %d\n", boolSolver(ws.Signaled()), ws.Signal())
-				fmt.Printf("STOPPED: %s\tSTOP SIGNAL: %d\n", boolSolver(ws.Stopped()), ws.StopSignal())
+				if skips > 10 || mem > int(profile.memory.Cur) {
+					proc.Kill()
+					mark = MLE
+				}
 			} else {
 				// Child Process has died
-				fmt.Printf("EXITED: %s\tEXIT CODE: %d\n", boolSolver(ws.Exited()), ws.ExitStatus())
-				fmt.Printf("SIGNALLED: %s\tSIGNAL: %d\n", boolSolver(ws.Signaled()), ws.Signal())
-				fmt.Printf("STOPPED: %s\tSTOP SIGNAL: %d\n", boolSolver(ws.Stopped()), ws.StopSignal())
+				if ws.Exited() && ws.ExitStatus() != 0 {
+					mark = fmt.Sprintf(NZEC, ws.ExitStatus())
+				} else if ws.Stopped() && ws.StopSignal() != 0 {
+					mark = fmt.Sprintf("Command terminated by signal (%d: %s)\n", ws.StopSignal(), ws.StopSignal().String())
+				} else if ws.Signaled() {
+					if ws.Signal() == syscall.SIGKILL {
+						mark = TLE
+					} else if ws.Signal() == syscall.SIGXFSZ {
+						mark = OLE
+					} else if ws.Signal() == syscall.SIGHUP {
+						mark = RF
+					} else if ws.Signal() == syscall.SIGPIPE {
+						mark = IE
+					} else {
+						mark = fmt.Sprintf("Program terminated by signal (%d: %s)\n", ws.Signal(), ws.Signal().String())
+					}
+				} else {
+					mark = OK
+				}
+				// Stop the ticker and exit polling loop
 				ticker.Stop()
 				fmt.Println()
 				break
 			}
-			fmt.Println()
 		}
 	}
 	tfinish = time.Now().UnixNano()
+	printstats(mark)
+	printstats(fmt.Sprintf("ELAPSED_TIME: %.03f s\n", float64(tfinish-tstart)/ns2s))
+	printstats(fmt.Sprintf("MEMORY_USED: %d kB\n", mem))
+	printstats(fmt.Sprintf("CPU_TIME: %.03f s\n", float64(utime)))
+
 	fmt.Printf("TIME: %.03f s\n", float64(tfinish-tstart)/ns2s)
 	fmt.Println("EXITING", os.Getpid())
+
+	return
 }
