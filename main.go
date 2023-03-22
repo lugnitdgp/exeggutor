@@ -297,9 +297,7 @@ func main() {
 	signal.Notify(c, unix.SIGALRM)
 	go func() {
 		<-c
-		fmt.Println("Received SIGALRM")
 		mark = RTLE
-		fmt.Print(mark)
 		proc, err := os.FindProcess((int(pid)))
 		if err == nil {
 			proc.Kill()
@@ -309,7 +307,6 @@ func main() {
 		tfinish = time.Now().UnixNano()
 	}()
 
-	fmt.Println("start", time.Now().UnixNano())
 	tstart = time.Now().UnixNano()
 
 	pid, _, err = unix.Syscall(unix.SYS_FORK, 0, 0, 0)
@@ -419,7 +416,6 @@ func main() {
 				}
 				// Stop the ticker and exit polling loop
 				ticker.Stop()
-				fmt.Println()
 				break
 			}
 		}
